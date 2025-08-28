@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Position数值替换工具（Web版）</title>
+    <!-- 引入Bootstrap简化样式（无需本地下载，CDN直接加载） -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- 引入JSZip（用于批量文件打包下载，CDN加载） -->
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body class="container mt-4">
+    <h2 class="mb-4">Position数值替换工具</h2>
+
+    <!-- 1. 顶部操作按钮区 -->
+    <div class="card mb-3 p-3">
+        <div class="d-flex gap-2 flex-wrap">
+            <!-- 选择单个/多个文件 -->
+            <div class="input-group">
+                <label class="input-group-text" for="fileInput">选择文件</label>
+                <input type="file" class="form-control" id="fileInput" multiple accept=".txt,.java,.xml,.properties,.json,.yml,.yaml,.kt">
+            </div>
+            <!-- 选择文件夹（支持递归处理子目录） -->
+            <div class="input-group">
+                <label class="input-group-text" for="folderInput">选择文件夹</label>
+                <input type="file" class="form-control" id="folderInput" webkitdirectory>
+            </div>
+            <!-- 操作按钮 -->
+            <button class="btn btn-danger" id="removeSelectedBtn">移除选中</button>
+            <button class="btn btn-warning" id="clearAllBtn">清空列表</button>
+            <button class="btn btn-success" id="processBtn">执行替换</button>
+            <button class="btn btn-primary" id="downloadBtn" disabled>下载结果</button>
+        </div>
+    </div>
+
+    <!-- 2. 中间内容区（文件列表 + 日志） -->
+    <div class="row gap-4 mb-3">
+        <!-- 左侧：已选择文件列表 -->
+        <div class="col-md-5">
+            <div class="card h-100">
+                <div class="card-header">已选择的文件（共<span id="fileCount">0</span>个）</div>
+                <div class="card-body overflow-auto" style="max-height: 300px;">
+                    <ul class="list-group" id="fileList"></ul>
+                </div>
+            </div>
+        </div>
+        <!-- 右侧：处理日志 -->
+        <div class="col-md-7">
+            <div class="card h-100">
+                <div class="card-header">处理日志</div>
+                <div class="card-body overflow-auto" style="max-height: 300px;">
+                    <pre class="bg-light p-2 rounded" id="logArea" style="white-space: pre-wrap; word-break: break-all;"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. 底部进度条 -->
+    <div class="card p-3">
+        <div class="d-flex align-items-center gap-2">
+            <span>处理进度：</span>
+            <progress id="progressBar" value="0" max="100" class="flex-grow-1"></progress>
+            <span id="progressText">0%</span>
+        </div>
+    </div>
+
+    <script>
+        // -------------------------- 全局变量 --------------------------
+        let selectedFiles = []; // 存储已选择的文件（含文件夹内的文件）
+        let processedFiles = new Map(); // 存储处理后的文件（key: 文件名, value: Blob）
+        let isProcessing = false; // 标记是否正在处理
+
+        // -------------------------- DOM元素获取 --------------------------
+        const fileInput = document.getElementById('fileInput');
+        const folderInput = document.getElementById('folderInput');
+        const removeSelectedBtn = document.getElementById('removeSelectedBtn');
+        const clearAllBtn = document.getElementById('clearAllBtn');
+        const processBtn = document.getElementById('processBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const fileList = document.getElementById('fileList');
+        const fileCount = document.getElementById('fileCount');
+        const logArea = document.getElementById('logArea');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+
+        // -------------------------- 工具函数 --------------------------
+        /**
+         * 日志记录函数
+         * @param {string} message 日志内容
+         * @param {boolean} isError 是否为错误日志（红色显示）
+         */
+        function log(message, isError = false) {
+            const time = new Date().toLocaleTimeString();
+            const logItem = `<span>[${time}]</span> ${isError ? '<span class="text-danger">错误：</span>' : '<span class="text-secondary">信息：</span>'} ${message}\n`;
+            logArea.innerHTML += logItem;
+            // 自动滚动到日志底部
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        /**
+         * 更新文件列表UI
+         */
+        function updateFileListUI() {
+            fileList.innerHTML = '';
+            if (selectedFiles.length === 0) {
+                fileList.innerHTML = '<li class="list-group-item text-muted">暂无选中文件</li>';
+                fileCount.textContent = '0';
+                return;
+            }
+            // 渲染每个文件（带复选框）
+            selectedFiles.forEach((file, index) => {
+                const li = document.createElement('li');
+                li.className = 'list-group-item d-flex align-items-center gap-2';
+                li.innerHTML = `
+                    <input type="checkbox" class="form-check-input" data-index="${index}">
+                    <span class="flex-grow-1" title="${file.relativePath || file.name}">${file.relativePath || file.name}</span>
+                    <span class="text-muted">(${formatFileSize(file.size)})</span>
+                `;
+                fileList.appendChild(li);
+            });
+            fileCount.textContent = selectedFiles.length;
+        }
+
+        /**
+         * 格式化文件大小（B→KB→MB）
+         * @param {number} bytes 文件大小（字节）
+         * @returns {string} 格式化后的大小字符串
+         */
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        /**
+         * 检测文件的换行符（保持原格式）
+         * @param {string} content 文件内容
+         * @returns {string} 换行符（\r\n|\n|\r），默认用浏览器换行符
+         */
+        function detectLineSeparator(content) {
+            if (content.includes('\r\n')) return '\r\n';
+            if (content.includes('\n')) return '\n';
+            if (content.includes('\r')) return '\r';
+            return '\n'; // 浏览器默认换行符
+        }
+
+        /**
+         * 处理单个文件的position替换
+         * @param {File} file 待处理的文件
+         * @returns {Promise<{name: string, blob: Blob}>} 处理后的文件名和Blob对象
+         */
+        function processSingleFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                // 按UTF-8读取文件（避免乱码）
+                reader.readAsText(file, 'UTF-8');
+
+                reader.onload = () => {
+                    try {
+                        const content = reader.result;
+                        const lineSeparator = detectLineSeparator(content);
+                        // 按原换行符分割行（保留空行）
+                        const lines = content.split(lineSeparator);
+                        let positionCounter = 1;
+                        let hasChanges = false;
+
+                        // 替换position逻辑（与Java原逻辑一致）
+                        for (let i = 0; i < lines.length; i++) {
+                            const line = lines[i];
+                            if (line.includes('position')) {
+                                const updatedLine = line.replace(/position\s*=\s*\d+/, `position = ${positionCounter}`);
+                                if (updatedLine !== line) {
+                                    lines[i] = updatedLine;
+                                    hasChanges = true;
+                                }
+                                positionCounter++;
+                            }
+                        }
+
+                        // 处理末尾空行（保持原文件特性）
+                        const originalEndsWithNewLine = content.endsWith('\r\n') || content.endsWith('\n') || content.endsWith('\r');
+                        let updatedContent = lines.join(lineSeparator);
+                        if (originalEndsWithNewLine) {
+                            updatedContent += lineSeparator;
+                        }
+
+                        // 生成处理后的Blob（UTF-8编码）
+                        const blob = new Blob([updatedContent], { type: 'text/plain; charset=utf-8' });
+                        resolve({
+                            name: file.relativePath || file.name, // 保留文件夹的相对路径
+                            blob: blob
+                        });
+                        log(`处理完成：${file.relativePath || file.name}（${hasChanges ? '已更新' : '无修改'}）`);
+                    } catch (error) {
+                        reject(new Error(`处理${file.name}失败：${error.message}`));
+                    }
+                };
+
+                reader.onerror = () => {
+                    reject(new Error(`读取${file.name}失败：${reader.error.message}`));
+                };
+            });
+        }
+
+        // -------------------------- 事件绑定 --------------------------
+        /**
+         * 1. 选择文件（单个/多个）
+         */
+        fileInput.addEventListener('change', (e) => {
+            if (isProcessing) {
+                log('正在处理文件，暂不允许添加新文件', true);
+                return;
+            }
+            const newFiles = Array.from(e.target.files);
+            if (newFiles.length === 0) return;
+
+            // 去重（避免重复添加同一文件）
+            const uniqueFiles = newFiles.filter(newFile => 
+                !selectedFiles.some(existFile => existFile.name === newFile.name && existFile.size === newFile.size)
+            );
+            selectedFiles.push(...uniqueFiles);
+            updateFileListUI();
+            log(`添加了${uniqueFiles.length}个文件`);
+
+            // 重置input（否则无法重复选择同一文件）
+            e.target.value = '';
+        });
+
+        /**
+         * 2. 选择文件夹（递归处理子目录）
+         */
+        folderInput.addEventListener('change', (e) => {
+            if (isProcessing) {
+                log('正在处理文件，暂不允许添加新文件', true);
+                return;
+            }
+            const newFiles = Array.from(e.target.files);
+            if (newFiles.length === 0) return;
+
+            // 去重（按相对路径+大小去重，避免同一文件夹内重复文件）
+            const uniqueFiles = newFiles.filter(newFile => 
+                !selectedFiles.some(existFile => 
+                    (existFile.relativePath || existFile.name) === (newFile.relativePath || newFile.name) 
+                    && existFile.size === newFile.size
+                )
+            );
+            selectedFiles.push(...uniqueFiles);
+            updateFileListUI();
+            log(`添加了文件夹内的${uniqueFiles.length}个文件（含子目录）`);
+
+            // 重置input
+            e.target.value = '';
+        });
+
+        /**
+         * 3. 移除选中文件
+         */
+        removeSelectedBtn.addEventListener('click', () => {
+            if (isProcessing) {
+                log('正在处理文件，暂不允许移除', true);
+                return;
+            }
+            // 获取所有被选中的复选框索引
+            const checkedIndexes = Array.from(document.querySelectorAll('.form-check-input:checked'))
+                .map(checkbox => parseInt(checkbox.dataset.index))
+                .sort((a, b) => b - a); // 倒序删除，避免索引错乱
+
+            if (checkedIndexes.length === 0) {
+                log('请先选中要移除的文件', true);
+                return;
+            }
+
+            // 移除选中的文件
+            checkedIndexes.forEach(index => {
+                const removedFile = selectedFiles.splice(index, 1)[0];
+                log(`移除文件：${removedFile.relativePath || removedFile.name}`);
+            });
+            updateFileListUI();
+            // 若已处理文件被移除，同步删除processedFiles
+            checkedIndexes.forEach(index => {
+                const removedFile = selectedFiles[index]; // 注意：splice后索引已变，这里需重新匹配
+                if (removedFile) {
+                    processedFiles.delete(removedFile.relativePath || removedFile.name);
+                }
+            });
+            downloadBtn.disabled = processedFiles.size === 0;
+        });
+
+        /**
+         * 4. 清空所有文件
+         */
+        clearAllBtn.addEventListener('click', () => {
+            if (isProcessing) {
+                log('正在处理文件，暂不允许清空', true);
+                return;
+            }
+            if (selectedFiles.length === 0) return;
+
+            selectedFiles = [];
+            processedFiles.clear();
+            updateFileListUI();
+            log('已清空所有选中文件');
+            downloadBtn.disabled = true;
+        });
+
+        /**
+         * 5. 执行替换（核心逻辑）
+         */
+        processBtn.addEventListener('click', async () => {
+            if (selectedFiles.length === 0) {
+                log('请先添加文件或文件夹', true);
+                return;
+            }
+            if (isProcessing) {
+                log('已在处理中，请勿重复点击', true);
+                return;
+            }
+
+            // 初始化处理状态
+            isProcessing = true;
+            processedFiles.clear();
+            progressBar.value = 0;
+            progressText.textContent = '0%';
+            processBtn.disabled = true;
+            downloadBtn.disabled = true;
+            log('开始处理文件...');
+
+            try {
+                const totalFiles = selectedFiles.length;
+                let processedCount = 0;
+
+                // 批量处理所有文件（按顺序执行）
+                for (const file of selectedFiles) {
+                    const result = await processSingleFile(file);
+                    processedFiles.set(result.name, result.blob);
+                    processedCount++;
+
+                    // 更新进度
+                    const progress = Math.round((processedCount / totalFiles) * 100);
+                    progressBar.value = progress;
+                    progressText.textContent = `${progress}%`;
+                }
+
+                log(`全部处理完成！共处理${totalFiles}个文件，可点击「下载结果」获取文件`);
+                downloadBtn.disabled = false;
+            } catch (error) {
+                log(error.message, true);
+            } finally {
+                // 恢复状态
+                isProcessing = false;
+                processBtn.disabled = false;
+            }
+        });
+
+        /**
+         * 6. 下载处理结果（单个文件直接下载，多个文件打包成ZIP）
+         */
+        downloadBtn.addEventListener('click', async () => {
+            if (processedFiles.size === 0) {
+                log('暂无处理后的文件可下载', true);
+                return;
+            }
+
+            log('开始准备下载文件...');
+            const fileEntries = Array.from(processedFiles.entries());
+
+            // 单个文件：直接生成下载链接
+            if (fileEntries.length === 1) {
+                const [fileName, blob] = fileEntries[0];
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                a.click();
+                URL.revokeObjectURL(url); // 释放URL资源
+                log(`已开始下载：${fileName}`);
+                return;
+            }
+
+            // 多个文件：用JSZip打包成ZIP下载
+            try {
+                const zip = new JSZip();
+                // 将所有处理后的文件添加到ZIP（保留相对路径，如文件夹内的文件会按原目录结构存放）
+                fileEntries.forEach(([fileName, blob]) => {
+                    zip.file(fileName, blob);
+                });
+
+                // 生成ZIP文件并下载
+                const zipBlob = await zip.generateAsync({ type: 'blob' });
+                const url = URL.createObjectURL(zipBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `position-replaced-${new Date().getTime()}.zip`; // 按时间命名ZIP
+                a.click();
+                URL.revokeObjectURL(url);
+                log(`已开始下载压缩包（含${fileEntries.length}个文件）`);
+            } catch (error) {
+                log(`打包下载失败：${error.message}`, true);
+            }
+        });
+
+        // -------------------------- 初始化UI --------------------------
+        updateFileListUI();
+        log('工具已就绪，可添加文件或文件夹开始处理');
+    </script>
+</body>
+</html>
